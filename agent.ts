@@ -1,4 +1,4 @@
-import { OpenAIEmbeddings } from "@langchain/openai";
+import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import {
@@ -15,62 +15,192 @@ import { MongoClient } from "mongodb";
 import { z } from "zod";
 import "dotenv/config";
 
-export async function callAgent(client: MongoClient, query: string, thread_id: string) {
+export async function callAgent(
+  client: MongoClient,
+  query: string,
+  thread_id: string
+) {
   // Define the MongoDB database and collection
   const dbName = "hr_database";
   const db = client.db(dbName);
-  const collection = db.collection("employees");
 
   // Define the graph state
   const GraphState = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
       reducer: (x, y) => x.concat(y),
     }),
+    expenses: Annotation<any[]>({
+      reducer: (x, y) => x.concat(y),
+    }),
+    spendingLimits: Annotation<any>({
+      reducer: (x, y) => x.concat(y),
+    }),
+    spendingCategories: Annotation<any[]>({
+      reducer: (x, y) => x.concat(y),
+    }),
+    alerts: Annotation<any[]>({
+      reducer: (x, y) => x.concat(y),
+    }),
   });
 
-  // Define the tools for the agent to use
-  const employeeLookupTool = tool(
-    async ({ query, n = 10 }) => {
-      console.log("Employee lookup tool called");
+  const saveSpendingTool = tool(
+    async ({ amount }) => {
+      console.log("Save spending tool called");
 
-      const dbConfig = {
-        collection: collection,
-        indexName: "vector_index",
-        textKey: "embedding_text",
-        embeddingKey: "embedding",
-      };
+      const spendingsCollection = db.collection("spendings");
+      const result = await spendingsCollection.insertOne({
+        amount,
+        date: new Date(),
+      });
 
-      // Initialize vector store
-      const vectorStore = new MongoDBAtlasVectorSearch(
-        new OpenAIEmbeddings(),
-        dbConfig
-      );
-
-      const result = await vectorStore.similaritySearchWithScore(query, n);
-      return JSON.stringify(result);
+      return `Successfully saved your spending of $${amount}.`;
     },
     {
-      name: "employee_lookup",
-      description: "Gathers employee details from the HR database",
+      name: "save_spending",
+      description: "Saves the user's spending to the database",
       schema: z.object({
-        query: z.string().describe("The search query"),
-        n: z
-          .number()
-          .optional()
-          .default(10)
-          .describe("Number of results to return"),
+        amount: z.number().describe("The amount spent"),
       }),
     }
   );
 
-  const tools = [employeeLookupTool];
-  
+  const checkPastWeekSpendingTool = tool(
+    async () => {
+      console.log("Check past week spending tool called");
+
+      const expensesCollection = db.collection("expenses");
+      const oneWeekAgo = new Date();
+      oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+      const expenses = await expensesCollection
+        .find({ date: { $gte: oneWeekAgo } })
+        .toArray();
+
+      const spendingByCategory = expenses.reduce(
+        (acc: { [key: string]: number }, expense) => {
+          if (!acc[expense.category]) {
+            acc[expense.category] = 0;
+          }
+          acc[expense.category] += expense.amount;
+          return acc;
+        },
+        {}
+      );
+
+      const summary = Object.entries(spendingByCategory)
+        .map(([category, amount]) => `You spent $${amount} on ${category}.`)
+        .join("\n");
+
+      return `Here's your spending summary for the past week:\n${summary}`;
+    },
+    {
+      name: "check_past_week_spending",
+      description: "Checks how much the user has spent in the past week",
+      schema: z.object({}),
+    }
+  );
+
+  const expenseTrackerTool = tool(
+    async ({ amount }) => {
+      console.log("Expense Tracker Tool called");
+
+      const category = await model.invoke([
+        new HumanMessage("What category are you spending on?"),
+      ]);
+
+      const expensesCollection = db.collection("expenses");
+      const result = await expensesCollection.insertOne({
+        amount,
+        category: category.content,
+        date: new Date(),
+      });
+
+      return `Successfully logged your expense of $${amount} in category ${category.content}.`;
+    },
+    {
+      name: "log_expense",
+      description: "Logs the user's expense in a specific category",
+      schema: z.object({
+        amount: z.number().describe("The amount spent"),
+      }),
+    }
+  );
+
+  const tipsRecommendationTool = tool(
+    async () => {
+      console.log("Tips & Recommendation Tool called");
+
+      const expensesCollection = db.collection("expenses");
+      const oneWeekAgo = new Date();
+      oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+      const expenses = await expensesCollection
+        .find({ date: { $gte: oneWeekAgo } })
+        .toArray();
+
+      const spendingByCategory = expenses.reduce(
+        (acc: { [key: string]: number }, expense) => {
+          if (!acc[expense.category]) {
+            acc[expense.category] = 0;
+          }
+          acc[expense.category] += expense.amount;
+          return acc;
+        },
+        {}
+      );
+
+      const prompt = `Based on the following spending data, provide personalized financial tips:
+${Object.entries(spendingByCategory)
+  .map(([category, amount]) => `- Spent $${amount} on ${category}`)
+  .join("\n")}
+`;
+
+      const result = await model.invoke([new HumanMessage(prompt)]);
+
+      return result.content;
+    },
+    {
+      name: "provide_tips",
+      description: "Provides advice on the user's spending habits",
+      schema: z.object({}),
+    }
+  );
+
+  const spendingLimitTool = tool(
+    async ({ limit }) => {
+      console.log("Spending Limit Tool called");
+
+      const spendingLimitsCollection = db.collection("spending_limits");
+      const result = await spendingLimitsCollection.insertOne({
+        limit,
+        date: new Date(),
+      });
+
+      return `Successfully set a spending limit of $${limit}.`;
+    },
+    {
+      name: "set_spending_limit",
+      description: "Sets a spending limit",
+      schema: z.object({
+        limit: z.number().describe("The spending limit"),
+      }),
+    }
+  );
+
+  const tools = [
+    saveSpendingTool,
+    checkPastWeekSpendingTool,
+    expenseTrackerTool,
+    tipsRecommendationTool,
+    spendingLimitTool,
+  ];
+
   // We can extract the state typing via `GraphState.State`
   const toolNode = new ToolNode<typeof GraphState.State>(tools);
 
-  const model = new ChatAnthropic({
-    model: "claude-3-5-sonnet-20240620",
-    temperature: 0,
+  const model = new ChatOpenAI({
+    modelName: "gpt-4o",
+    temperature: 1,
   }).bindTools(tools);
 
   // Define the function that determines whether to continue or not
@@ -91,13 +221,16 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
     const prompt = ChatPromptTemplate.fromMessages([
       [
         "system",
-        `You are a helpful AI assistant, collaborating with other assistants. Use the provided tools to progress towards answering the question. If you are unable to fully answer, that's OK, another assistant with different tools will help where you left off. Execute what you can to make progress. If you or any of the other assistants have the final answer or deliverable, prefix your response with FINAL ANSWER so the team knows to stop. You have access to the following tools: {tool_names}.\n{system_message}\nCurrent time: {time}.`,
+        `You are a helpful AI finance assistant, collaborating with other specialized financial assistants. Use the provided tools to help users track their expenses, manage budgets, and receive personalized financial advice. If you are unable to fully answer, that's OK — another assistant with different capabilities will continue where you left off. Execute whatever tasks you can to move the user toward financial clarity and actionable insights. If you or any of the other assistants arrive at a complete recommendation or report, prefix your response with FINAL ANSWER so the team knows to stop. You have access to the following tools: {tool_names}.
+{system_message}
+Current time: {time}.
+`,
       ],
       new MessagesPlaceholder("messages"),
     ]);
 
     const formattedPrompt = await prompt.formatMessages({
-      system_message: "You are helpful HR Chatbot Agent.",
+      system_message: "You are helpful Financial assistant Chatbot Agent.",
       time: new Date().toISOString(),
       tool_names: tools.map((tool) => tool.name).join(", "),
       messages: state.messages,
